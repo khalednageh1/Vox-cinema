@@ -1,288 +1,28 @@
-#!/usr/bin/env python3
-"""
-VOX Cinemas Egypt showtime watcher.
+name: Check Cinema Events
 
-Fetches the movie page(s) for every date tab, compares the sessions with the
-ones already seen (state.json) and pushes a notification to your iPhone
-through ntfy when NEW sessions appear.
+on:
+  schedule:
+    - cron: '*/30 * * * *' # يتم فحص الحفلات كل 30 دقيقة تلقائياً
+  workflow_dispatch: # يسمح بالتشغيل اليدوي من تاب Actions
 
-Env vars:
-  NTFY_TOPIC        (required) your secret ntfy topic name
-  NTFY_SERVER       default https://ntfy.sh
-  MOVIE_SLUGS       comma list, default both Avengers: Doomsday pages
-  CINEMAS           optional comma list, substring match (e.g. "almaza,mall of egypt")
-  DATE_FROM/DATE_TO date window to watch, YYYYMMDD inclusive (default 20261224-20261231)
-  NOTIFY_EXISTING   "1" = also alert for sessions already live on the first run
-  FAIL_ALERT_AFTER  consecutive failed runs before a "bot is broken" alert (default 6)
-  STATE_FILE        default state.json
+jobs:
+  run-monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-Usage:
-  python monitor.py          normal run
-  python monitor.py --test   send a test notification and exit
-"""
-import json
-import os
-import re
-import sys
-import time
-from datetime import datetime, timedelta
-from pathlib import Path
-from urllib.parse import quote  # noqa: F401  (kept for easy extension)
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-import requests
-from bs4 import BeautifulSoup
+      - name: Install dependencies
+        run: |
+          pip install requests beautifulsoup4
 
-BASE = os.getenv("VOX_BASE", "https://egy.voxcinemas.com").rstrip("/")
-SLUGS = [
-    s.strip()
-    for s in os.getenv(
-        "MOVIE_SLUGS", "avengers-doomsday,avengers-doomsday-infinity-vision"
-    ).split(",")
-    if s.strip()
-]
-CINEMAS = [c.strip().lower() for c in os.getenv("CINEMAS", "").split(",") if c.strip()]
-NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
-NTFY_TOPIC = os.getenv("NTFY_TOPIC", "").strip()
-STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
-FAIL_ALERT_AFTER = int(os.getenv("FAIL_ALERT_AFTER", "6"))
-NOTIFY_EXISTING = os.getenv("NOTIFY_EXISTING", "0") == "1"
-# Only watch this date window (YYYYMMDD, inclusive). Default: 24-31 Dec 2026.
-DATE_FROM = os.getenv("DATE_FROM", "20261224").strip()
-DATE_TO = os.getenv("DATE_TO", "20261231").strip()
-
-
-def in_range(d: str) -> bool:
-    return DATE_FROM <= d <= DATE_TO
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-TIME_RE = re.compile(r"^\d{1,2}:\d{2}\s?(am|pm)$", re.I)
-DATE_LINK_RE = re.compile(r"[?&]d=(\d{8})")
-
-
-# ----------------------------------------------------------------- fetching
-class NotFound(Exception):
-    pass
-
-
-def fetch(url: str, retries: int = 3) -> str:
-    last = None
-    for attempt in range(retries):
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=20)
-            if r.status_code == 404:
-                raise NotFound(url)
-            r.raise_for_status()
-            return r.text
-        except NotFound:
-            raise
-        except Exception as e:  # network / 5xx / 403
-            last = e
-            time.sleep(2 * (attempt + 1))
-    raise RuntimeError(f"failed to fetch {url}: {last}")
-
-
-# ------------------------------------------------------------------ parsing
-def parse_page(html: str):
-    """Return (title, date_links, sessions).
-
-    date_links: sorted list of YYYYMMDD found in the date tabs (clickable ones)
-    sessions:   set of (cinema, format, time)
-    """
-    soup = BeautifulSoup(html, "html.parser")
-
-    h1 = soup.find("h1")
-    title = h1.get_text(" ", strip=True) if h1 else ""
-
-    date_links = sorted(
-        {m.group(1) for a in soup.find_all("a", href=True) if (m := DATE_LINK_RE.search(a["href"]))}
-    )
-
-    container = soup.find(id="showtimes") or soup
-    cinema_names = {h.get_text(" ", strip=True) for h in container.find_all("h3")}
-    cinema_names.discard("")
-
-    sessions = set()
-    cinema = fmt = None
-    for raw in container.get_text("\n").splitlines():
-        line = " ".join(raw.split())
-        if not line:
-            continue
-        if line in cinema_names:
-            cinema, fmt = line, None
-        elif TIME_RE.match(line):
-            if cinema and fmt:
-                sessions.add((cinema, fmt, line.lower().replace(" ", "")))
-        elif cinema:
-            fmt = line  # format heading (Standard / GOLD / MAX / IMAX ...)
-    return title, date_links, sessions
-
-
-def collect_movie(slug: str):
-    """Fetch every date tab of a movie. Returns (title, {key: info})."""
-    url = f"{BASE}/movies/{slug}"
-    html0 = fetch(url)
-    title, links, sessions0 = parse_page(html0)
-    title = title or slug
-
-    # The default page shows the first tab (not a link); it is the day before the first link.
-    if links:
-        first = (datetime.strptime(links[0], "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
-    else:
-        first = datetime.now().strftime("%Y%m%d")
-
-    per_date = {first: sessions0} if in_range(first) else {}
-    for d in links:
-        if not in_range(d):
-            continue
-        time.sleep(1)
-        _, _, s = parse_page(fetch(f"{url}?d={d}"))
-        per_date[d] = s
-
-    found = {}
-    for d, sessions in per_date.items():
-        for cinema, fmt, t in sessions:
-            if CINEMAS and not any(c in cinema.lower() for c in CINEMAS):
-                continue
-            found[f"{slug}|{d}|{cinema}|{fmt}|{t}"] = {
-                "slug": slug, "title": title, "date": d, "cinema": cinema, "format": fmt, "time": t,
-            }
-    return title, found
-
-
-# ------------------------------------------------------------- notification
-def notify(title: str, message: str, click: str = "", priority: int = 4, tags=("clapper",)):
-    if not NTFY_TOPIC:
-        print("NTFY_TOPIC not set - printing instead:\n", title, "\n", message)
-        return
-    payload = {
-        "topic": NTFY_TOPIC,
-        "title": title,
-        "message": message[:3800],
-        "priority": priority,
-        "tags": list(tags),
-    }
-    if click:
-        payload["click"] = click
-    r = requests.post(NTFY_SERVER, json=payload, timeout=20)
-    r.raise_for_status()
-
-
-def nice_date(d: str) -> str:
-    return datetime.strptime(d, "%Y%m%d").strftime("%a %d %b")
-
-
-def format_new(new_items):
-    """Group new sessions by movie > date > cinema/format."""
-    lines = []
-    by_movie = {}
-    for it in new_items:
-        by_movie.setdefault(it["title"], []).append(it)
-    for movie, items in sorted(by_movie.items()):
-        lines.append(f"ð¬ {movie}")
-        by_date = {}
-        for it in items:
-            by_date.setdefault(it["date"], []).append(it)
-        for d in sorted(by_date):
-            lines.append(f"ð {nice_date(d)}")
-            grouped = {}
-            for it in by_date[d]:
-                grouped.setdefault((it["cinema"], it["format"]), []).append(it["time"])
-            for (cinema, fmt), times in sorted(grouped.items()):
-                times.sort(key=lambda t: datetime.strptime(t, "%I:%M%p"))
-                lines.append(f"â¢ {cinema} ({fmt}): {', '.join(times)}")
-        lines.append("")
-    return "\n".join(lines).strip()
-
-
-# -------------------------------------------------------------------- state
-def load_state():
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text())
-        except Exception:
-            pass
-    return {"initialized": False, "seen": [], "fails": 0}
-
-
-def save_state(state):
-    state["seen"] = sorted(set(state["seen"]))
-    STATE_FILE.write_text(json.dumps(state, indent=1, ensure_ascii=False))
-
-
-# --------------------------------------------------------------------- main
-def main():
-    if "--test" in sys.argv:
-        notify("â Ø¨ÙØª ÙÙÙØ³ Ø´ØºØ§Ù", "ÙÙ ÙØµÙØªÙÙ Ø§ÙØ±Ø³Ø§ÙØ© Ø¯Ù ÙØ¨ÙÙ Ø§ÙØ¥Ø´Ø¹Ø§Ø±Ø§Øª ÙØªØ¸Ø¨Ø·Ø©.", priority=3)
-        print("test notification sent")
-        return 0
-
-    if not NTFY_TOPIC:
-        print("ERROR: set NTFY_TOPIC", file=sys.stderr)
-        return 2
-
-    state = load_state()
-    current, errors = {}, []
-    for slug in SLUGS:
-        try:
-            _, found = collect_movie(slug)
-            current.update(found)
-            print(f"{slug}: {len(found)} sessions")
-        except NotFound:
-            print(f"{slug}: page not listed yet (404)")
-        except Exception as e:
-            errors.append(f"{slug}: {e}")
-            print("ERROR", e, file=sys.stderr)
-
-    seen = set(state["seen"])
-    new_keys = [k for k in current if k not in seen]
-
-    if not state["initialized"] and not errors:
-        # First successful run = baseline, so you are not spammed with what already exists.
-        if NOTIFY_EXISTING and new_keys:
-            notify("ð ÙÙØ§Ø¹ÙØ¯ ÙÙØ¬ÙØ¯Ø© Ø­Ø§ÙÙÙØ§", format_new([current[k] for k in new_keys]),
-                   click=f"{BASE}/movies/{SLUGS[0]}#showtimes")
-        else:
-            notify(
-                "â Ø¨Ø¯Ø£Øª Ø§ÙÙØ±Ø§ÙØ¨Ø©",
-                f"Ø¨Ø±Ø§ÙØ¨: {', '.join(SLUGS)}\nØ§ÙÙØªØ±Ø©: {nice_date(DATE_FROM)} â {nice_date(DATE_TO)}\n"
-                f"Ø§ÙØ­ÙÙØ§Øª Ø§ÙÙÙØ¬ÙØ¯Ø© Ø­Ø§ÙÙÙØ§ ÙÙ Ø§ÙÙØªØ±Ø© Ø¯Ù: {len(current)}\n"
-                "ÙØªÙØµÙÙ Ø±Ø³Ø§ÙØ© Ø£ÙÙ ÙØ§ ÙØ¸ÙØ± ÙÙØ¹Ø¯ Ø¬Ø¯ÙØ¯.",
-                priority=3,
-            )
-        state["initialized"] = True
-    elif new_keys:
-        items = [current[k] for k in new_keys]
-        first_date = sorted(i["date"] for i in items)[0]
-        slug = items[0]["slug"]
-        notify(
-            f"ð¥ ÙÙØ§Ø¹ÙØ¯ Ø¬Ø¯ÙØ¯Ø© ÙÙ ÙÙÙØ³ ({len(items)} Ø­ÙÙØ©)",
-            format_new(items),
-            click=f"{BASE}/movies/{slug}?d={first_date}#showtimes",
-            priority=5,
-        )
-        print(f"notified: {len(items)} new sessions")
-    else:
-        print("nothing new")
-
-    state["seen"] = list(seen | set(current))
-
-    if errors:
-        state["fails"] = state.get("fails", 0) + 1
-        if state["fails"] == FAIL_ALERT_AFTER:
-            notify("â ï¸ Ø¨ÙØª ÙÙÙØ³ ÙØ§ÙÙ", "\n".join(errors)[:500], priority=3, tags=("warning",))
-    else:
-        state["fails"] = 0
-
-    save_state(state)
-    return 1 if errors and not current else 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+      - name: Run script
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          python monitor.py
