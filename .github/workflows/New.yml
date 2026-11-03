@@ -1,0 +1,28 @@
+name: Check Cinema Events
+
+on:
+  schedule:
+    - cron: '*/30 * * * *' # يتم فحص الحفلات كل 30 دقيقة تلقائياً
+  workflow_dispatch: # يسمح بالتشغيل اليدوي من تاب Actions
+
+jobs:
+  run-monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install requests beautifulsoup4
+
+      - name: Run script
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          python monitor.py
